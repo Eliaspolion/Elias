@@ -34,7 +34,7 @@ const CONFIG = {
   ],
 
   // Where to send interested visitors (your contact section = the free first call)
-  BOOKING_URL: "https://eliaspolion.com/#contact",
+  BOOKING_URL: "https://calendly.com/eliaspolion/30min",
   CONTACT_URL: "https://eliaspolion.com/#contact",
 
   // Your real packages + Stripe checkout links (the bot shares these when asked)
