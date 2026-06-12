@@ -347,8 +347,8 @@
   }
   function linkify(s) {
     return escapeHtml(s).replace(
-      /(https?:\/\/[^\s<]+)/g,
-      '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+      /(https?:\/\/[^\s<]+?)([.,;:!?]*)(?=\s|$|&)/g,
+      '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>$2'
     );
   }
   function scrollDown() { log.scrollTop = log.scrollHeight; }
