@@ -1,43 +1,35 @@
 /* =============================================================================
- *  Elias Polion Coaching — AI Assistant Backend (100% FREE version)
- *  Cloudflare Worker + Workers AI (Llama). No API key, no bills.
+ *  Elias Polion Coaching — AI Assistant + Newsletter Backend (100% FREE)
+ *  Cloudflare Worker + Workers AI (chat) + Brevo (newsletter signups)
  * -----------------------------------------------------------------------------
- *  HOW IT'S FREE
- *  This runs the AI model on Cloudflare's own free allowance (10,000 Neurons/day,
- *  resets at 00:00 UTC) — plenty for a coaching site. There is NO Anthropic key
- *  and NO Web3Forms key here. Leads still arrive through your existing contact
- *  form on the page; the bot's job is to answer, qualify, and send people there.
+ *  TWO JOBS, ONE WORKER:
+ *   • POST /            → the AI chatbot (Llama on Workers AI, free)
+ *   • POST /subscribe   → adds an email to your Brevo newsletter list
  *
- *  DEPLOY WITHOUT ANY LOCAL TOOLS (all in the browser):
- *    1. dash.cloudflare.com → Workers & Pages → Create → Worker → name it
- *       "coaching-assistant" → Deploy.
- *    2. Edit code → paste THIS file → Deploy.
- *    3. Settings → Bindings → Add → "Workers AI" → Variable name: AI → Save.
- *       (This is what makes `env.AI` work. Without it the bot can't run.)
- *    4. Copy the Worker URL (…workers.dev) into chat-widget.js → WORKER_URL.
+ *  SECRET (add in the Cloudflare dashboard, NOT in this file):
+ *   • BREVO_API_KEY     your Brevo key (starts with xkeysib-)
+ *     Worker → Settings → Variables and Secrets → Add → type "Secret" →
+ *     name BREVO_API_KEY → paste the key → Save and deploy.
  *
- *  Edit CONFIG below to change packages, prices, links, or the model.
+ *  Then set BREVO_LIST_ID below to your Brevo list number.
  * ========================================================================== */
 
 const CONFIG = {
-  // Llama 3.3 70B (fast, free, good quality). If you ever hit the daily Neuron
-  // limit, switch to the lighter "@cf/meta/llama-3.1-8b-instruct-fast" — it uses
-  // far fewer Neurons so you get many more conversations per day.
   MODEL: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   MAX_TOKENS: 600,
 
-  // Front-end origins allowed to call this Worker (CORS). Keep this tight.
   ALLOWED_ORIGINS: [
     "https://eliaspolion.com",
     "https://www.eliaspolion.com",
-    // "http://localhost:8080", // for local testing only
   ],
 
-  // Where to send interested visitors (your contact section = the free first call)
+  // Booking + contact links
   BOOKING_URL: "https://calendly.com/eliaspolion/30min",
   CONTACT_URL: "https://eliaspolion.com/#contact",
 
-  // Your real packages + Stripe checkout links (the bot shares these when asked)
+  // 🔧 NEWSLETTER: replace 2 with YOUR Brevo list ID (a small number)
+  BREVO_LIST_ID: 3,
+
   PACKAGES: [
     {
       name: "Foundation — Performance Science",
@@ -98,7 +90,7 @@ ${packages}
 - Ask only ONE question at a time so it feels human.
 - Use the visitor's first name once you know it. Be specific, never generic.
 - When someone is interested, invite them to the free first conversation here:
-  ${CONFIG.BOOKING_URL}  (their message there reaches Elias directly).
+  ${CONFIG.BOOKING_URL}  (they can book a video call directly).
 - If they're ready to commit to a package, share that package's Stripe checkout link.
 
 # HARD SAFETY RULES (never break)
@@ -150,6 +142,86 @@ function sanitizeMessages(raw) {
   return trimmed.length ? trimmed : null;
 }
 
+function isValidEmail(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+/* ------------------------------ Chat handler ------------------------------ */
+async function handleChat(payload, env, origin) {
+  const history = sanitizeMessages(payload.messages);
+  if (!history) return json({ error: "No valid messages" }, 400, origin);
+
+  try {
+    const messages = [
+      { role: "system", content: buildSystemPrompt() },
+      ...history,
+    ];
+
+    const result = await env.AI.run(CONFIG.MODEL, {
+      messages,
+      max_tokens: CONFIG.MAX_TOKENS,
+    });
+
+    const reply =
+      (result && result.response && String(result.response).trim()) ||
+      "Thanks! For the next step, the first conversation is free — book here: " +
+        CONFIG.BOOKING_URL;
+
+    return json({ reply }, 200, origin);
+  } catch (err) {
+    console.error(err);
+    return json(
+      {
+        reply:
+          "Sorry — I'm having a brief technical hiccup. Please try again, or " +
+          `reach Elias directly here: ${CONFIG.CONTACT_URL}`,
+        error: "ai_error",
+      },
+      502,
+      origin
+    );
+  }
+}
+
+/* --------------------------- Subscribe handler ---------------------------- */
+async function handleSubscribe(payload, env, origin) {
+  const email = (payload.email || "").trim().toLowerCase();
+  if (!isValidEmail(email)) {
+    return json({ ok: false, error: "invalid_email" }, 400, origin);
+  }
+  if (!env.BREVO_API_KEY) {
+    return json({ ok: false, error: "not_configured" }, 500, origin);
+  }
+
+  try {
+    const res = await fetch("https://api.brevo.com/v3/contacts", {
+      method: "POST",
+      headers: {
+        "api-key": env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        email,
+        listIds: [CONFIG.BREVO_LIST_ID],
+        updateEnabled: true, // don't error if they're already a contact
+      }),
+    });
+
+    // Brevo returns 201 (created) or 204 (updated) on success.
+    if (res.ok || res.status === 204) {
+      return json({ ok: true }, 200, origin);
+    }
+
+    const detail = await res.text();
+    console.error("Brevo error", res.status, detail);
+    return json({ ok: false, error: "provider_error" }, 502, origin);
+  } catch (err) {
+    console.error(err);
+    return json({ ok: false, error: "network_error" }, 502, origin);
+  }
+}
+
 /* --------------------------------- Entry ---------------------------------- */
 export default {
   async fetch(request, env) {
@@ -172,39 +244,11 @@ export default {
       return json({ error: "Invalid JSON body" }, 400, origin);
     }
 
-    const history = sanitizeMessages(payload.messages);
-    if (!history) return json({ error: "No valid messages" }, 400, origin);
-
-    try {
-      // Workers AI expects a system message at the top of the messages array.
-      const messages = [
-        { role: "system", content: buildSystemPrompt() },
-        ...history,
-      ];
-
-      const result = await env.AI.run(CONFIG.MODEL, {
-        messages,
-        max_tokens: CONFIG.MAX_TOKENS,
-      });
-
-      const reply =
-        (result && result.response && String(result.response).trim()) ||
-        "Thanks! For the next step, the first conversation is free — reach Elias " +
-          `here: ${CONFIG.BOOKING_URL}`;
-
-      return json({ reply }, 200, origin);
-    } catch (err) {
-      console.error(err);
-      return json(
-        {
-          reply:
-            "Sorry — I'm having a brief technical hiccup. Please try again, or " +
-            `reach Elias directly here: ${CONFIG.CONTACT_URL}`,
-          error: "ai_error",
-        },
-        502,
-        origin
-      );
+    // Route by path: /subscribe → newsletter, anything else → chat
+    const path = new URL(request.url).pathname;
+    if (path.endsWith("/subscribe")) {
+      return handleSubscribe(payload, env, origin);
     }
+    return handleChat(payload, env, origin);
   },
 };
